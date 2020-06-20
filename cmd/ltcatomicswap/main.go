@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ltcsuite/ltcd/btcjson"
 	"github.com/ltcsuite/ltcd/chaincfg"
 	"github.com/ltcsuite/ltcd/chaincfg/chainhash"
 	rpc "github.com/ltcsuite/ltcd/rpcclient"
@@ -75,8 +76,8 @@ func init() {
 		fmt.Println("Usage: ltcatomicswap [flags] cmd [cmd args]")
 		fmt.Println()
 		fmt.Println("Commands:")
-		fmt.Println("  initiate <participant address> <amount>")
-		fmt.Println("  participate <initiator address> <amount> <secret hash>")
+		fmt.Println("  initiate <participant address> <amount> [{\"txid\":\"id\",\"vout\":n},...]")
+		fmt.Println("  participate <initiator address> <amount> <secret hash> [{\"txid\":\"id\",\"vout\":n},...]")
 		fmt.Println("  redeem <contract> <contract transaction> <secret>")
 		fmt.Println("  refund <contract> <contract transaction>")
 		fmt.Println("  extractsecret <redemption transaction> <secret hash>")
@@ -98,11 +99,13 @@ type offlineCommand interface {
 }
 
 type initiateCmd struct {
+	inputs  []btcjson.TransactionInput
 	cp2Addr *ltcutil.AddressPubKeyHash
 	amount  ltcutil.Amount
 }
 
 type participateCmd struct {
+	inputs     []btcjson.TransactionInput
 	cp1Addr    *ltcutil.AddressPubKeyHash
 	amount     ltcutil.Amount
 	secretHash []byte
@@ -142,7 +145,7 @@ func main() {
 	}
 }
 
-func checkCmdArgLength(args []string, required int) (nArgs int) {
+func checkCmdArgLength(args []string, required int, max int) (nArgs int) {
 	if len(args) < required {
 		return 0
 	}
@@ -151,7 +154,10 @@ func checkCmdArgLength(args []string, required int) (nArgs int) {
 			return i
 		}
 	}
-	return required
+	if len(args) > max {
+		return max
+	}
+	return len(args)
 }
 
 func run() (err error, showUsage bool) {
@@ -161,23 +167,30 @@ func run() (err error, showUsage bool) {
 		return nil, true
 	}
 	cmdArgs := 0
+	maxArgs := 0
 	switch args[0] {
 	case "initiate":
 		cmdArgs = 2
+		maxArgs = 3
 	case "participate":
 		cmdArgs = 3
+		maxArgs = 4
 	case "redeem":
 		cmdArgs = 3
+		maxArgs = 3
 	case "refund":
 		cmdArgs = 2
+		maxArgs = 2
 	case "extractsecret":
 		cmdArgs = 2
+		maxArgs = 2
 	case "auditcontract":
 		cmdArgs = 2
+		maxArgs = 2
 	default:
 		return fmt.Errorf("unknown command %v", args[0]), true
 	}
-	nArgs := checkCmdArgLength(args[1:], cmdArgs)
+	nArgs := checkCmdArgLength(args[1:], cmdArgs, maxArgs)
 	flagset.Parse(args[1+nArgs:])
 	if nArgs < cmdArgs {
 		return fmt.Errorf("%s: too few arguments", args[0]), true
@@ -215,7 +228,15 @@ func run() (err error, showUsage bool) {
 			return err, true
 		}
 
-		cmd = &initiateCmd{cp2Addr: cp2AddrP2PKH, amount: amount}
+		var inputs []btcjson.TransactionInput
+		if len(args) > 3 {
+			err = json.Unmarshal([]byte(args[3]), &inputs)
+			if err != nil {
+				return errors.New("invalid inputs"), true
+			}
+		}
+
+		cmd = &initiateCmd{inputs: inputs, cp2Addr: cp2AddrP2PKH, amount: amount}
 
 	case "participate":
 		cp1Addr, err := ltcutil.DecodeAddress(args[1], chainParams)
@@ -248,7 +269,15 @@ func run() (err error, showUsage bool) {
 			return errors.New("secret hash has wrong size"), true
 		}
 
-		cmd = &participateCmd{cp1Addr: cp1AddrP2PKH, amount: amount, secretHash: secretHash}
+		var inputs []btcjson.TransactionInput
+		if len(args) > 4 {
+			err = json.Unmarshal([]byte(args[4]), &inputs)
+			if err != nil {
+				return errors.New("invalid inputs"), true
+			}
+		}
+
+		cmd = &participateCmd{inputs: inputs, cp1Addr: cp1AddrP2PKH, amount: amount, secretHash: secretHash}
 
 	case "redeem":
 		contract, err := hex.DecodeString(args[1])
@@ -582,6 +611,7 @@ func promptPublishTx(c *rpc.Client, tx *wire.MsgTx, name string) error {
 // contractArgs specifies the common parameters used to create the initiator's
 // and participant's contract.
 type contractArgs struct {
+	inputs     []btcjson.TransactionInput
 	them       *ltcutil.AddressPubKeyHash
 	amount     ltcutil.Amount
 	locktime   int64
@@ -636,6 +666,16 @@ func buildContract(c *rpc.Client, args *contractArgs) (*builtContract, error) {
 
 	unsignedContract := wire.NewMsgTx(txVersion)
 	unsignedContract.AddTxOut(wire.NewTxOut(int64(args.amount), contractP2SHPkScript))
+	for _, input := range args.inputs {
+		txHash, err := chainhash.NewHashFromStr(input.Txid)
+		if err != nil {
+			return nil, err
+		}
+
+		prevOut := wire.NewOutPoint(txHash, input.Vout)
+		txIn := wire.NewTxIn(prevOut, []byte{}, nil)
+		unsignedContract.AddTxIn(txIn)
+	}
 	unsignedContract, contractFee, err := fundRawTransaction(c, unsignedContract, feePerKb)
 	if err != nil {
 		return nil, fmt.Errorf("fundrawtransaction: %v", err)
@@ -772,6 +812,7 @@ func (cmd *initiateCmd) runCommand(c *rpc.Client) error {
 	locktime := time.Now().Add(48 * time.Hour).Unix()
 
 	b, err := buildContract(c, &contractArgs{
+		inputs:     cmd.inputs,
 		them:       cmd.cp2Addr,
 		amount:     cmd.amount,
 		locktime:   locktime,
@@ -811,6 +852,7 @@ func (cmd *participateCmd) runCommand(c *rpc.Client) error {
 	locktime := time.Now().Add(24 * time.Hour).Unix()
 
 	b, err := buildContract(c, &contractArgs{
+		inputs:     cmd.inputs,
 		them:       cmd.cp1Addr,
 		amount:     cmd.amount,
 		locktime:   locktime,
