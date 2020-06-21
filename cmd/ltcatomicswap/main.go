@@ -611,11 +611,13 @@ func promptPublishTx(c *rpc.Client, tx *wire.MsgTx, name string) error {
 // contractArgs specifies the common parameters used to create the initiator's
 // and participant's contract.
 type contractArgs struct {
-	inputs     []btcjson.TransactionInput
-	them       *ltcutil.AddressPubKeyHash
-	amount     ltcutil.Amount
-	locktime   int64
-	secretHash []byte
+	inputs      []btcjson.TransactionInput
+	them        *ltcutil.AddressPubKeyHash
+	amount      ltcutil.Amount
+	locktime    int64
+	secretHash  []byte
+	feePerKb    ltcutil.Amount
+	minFeePerKb ltcutil.Amount
 }
 
 // builtContract houses the details regarding a contract and the contract
@@ -659,11 +661,6 @@ func buildContract(c *rpc.Client, args *contractArgs) (*builtContract, error) {
 		return nil, err
 	}
 
-	feePerKb, minFeePerKb, err := getFeePerKb(c)
-	if err != nil {
-		return nil, err
-	}
-
 	unsignedContract := wire.NewMsgTx(txVersion)
 	unsignedContract.AddTxOut(wire.NewTxOut(int64(args.amount), contractP2SHPkScript))
 	for _, input := range args.inputs {
@@ -676,7 +673,7 @@ func buildContract(c *rpc.Client, args *contractArgs) (*builtContract, error) {
 		txIn := wire.NewTxIn(prevOut, []byte{}, nil)
 		unsignedContract.AddTxIn(txIn)
 	}
-	unsignedContract, contractFee, err := fundRawTransaction(c, unsignedContract, feePerKb)
+	unsignedContract, contractFee, err := fundRawTransaction(c, unsignedContract, args.feePerKb)
 	if err != nil {
 		return nil, fmt.Errorf("fundrawtransaction: %v", err)
 	}
@@ -690,7 +687,7 @@ func buildContract(c *rpc.Client, args *contractArgs) (*builtContract, error) {
 
 	contractTxHash := contractTx.TxHash()
 
-	refundTx, refundFee, err := buildRefund(c, contract, contractTx, feePerKb, minFeePerKb)
+	refundTx, refundFee, err := buildRefund(c, contract, contractTx, args.feePerKb, args.minFeePerKb)
 	if err != nil {
 		return nil, err
 	}
@@ -790,6 +787,46 @@ func buildRefund(c *rpc.Client, contract []byte, contractTx *wire.MsgTx, feePerK
 	return refundTx, refundFee, nil
 }
 
+// redeemArgs specifies the common parameters used to create the redeem.
+type redeemArgs struct {
+	contract         []byte
+	contractTx       *wire.MsgTx
+	locktime         int64
+	contractOutPoint *wire.OutPoint
+	outScript        []byte
+	recipientAddr    ltcutil.Address
+	secret           []byte
+	feePerKb         ltcutil.Amount
+	minFeePerKb      ltcutil.Amount
+}
+
+func buildRedeem(c *rpc.Client, args *redeemArgs) (
+	RedeemTx *wire.MsgTx, RedeemFee ltcutil.Amount, err error) {
+
+	redeemTx := wire.NewMsgTx(txVersion)
+	redeemTx.LockTime = uint32(args.locktime)
+	redeemTx.AddTxIn(wire.NewTxIn(args.contractOutPoint, nil, nil))
+	redeemTx.AddTxOut(wire.NewTxOut(0, args.outScript)) // amount set below
+	redeemSize := estimateRedeemSerializeSize(args.contract, redeemTx.TxOut)
+	fee := txrules.FeeForSerializeSize(args.feePerKb, redeemSize)
+	redeemTx.TxOut[0].Value = args.contractTx.TxOut[args.contractOutPoint.Index].Value - int64(fee)
+	if txrules.IsDustOutput(redeemTx.TxOut[0], args.minFeePerKb) {
+		return nil, 0, fmt.Errorf("redeem output value of %v is dust", ltcutil.Amount(redeemTx.TxOut[0].Value))
+	}
+
+	redeemSig, redeemPubKey, err := createSig(redeemTx, 0, args.contract, args.recipientAddr, c)
+	if err != nil {
+		return nil, 0, err
+	}
+	redeemSigScript, err := redeemP2SHContract(args.contract, redeemSig, redeemPubKey, args.secret)
+	if err != nil {
+		return nil, 0, err
+	}
+	redeemTx.TxIn[0].SignatureScript = redeemSigScript
+
+	return redeemTx, fee, nil
+}
+
 func sha256Hash(x []byte) []byte {
 	h := sha256.Sum256(x)
 	return h[:]
@@ -811,12 +848,40 @@ func (cmd *initiateCmd) runCommand(c *rpc.Client) error {
 	// as a unix time rather than a block height.
 	locktime := time.Now().Add(48 * time.Hour).Unix()
 
+	feePerKb, minFeePerKb, err := getFeePerKb(c)
+	if err != nil {
+		return err
+	}
+
 	b, err := buildContract(c, &contractArgs{
-		inputs:     cmd.inputs,
-		them:       cmd.cp2Addr,
-		amount:     cmd.amount,
-		locktime:   locktime,
-		secretHash: secretHash,
+		inputs:      cmd.inputs,
+		them:        cmd.cp2Addr,
+		amount:      cmd.amount,
+		locktime:    locktime,
+		secretHash:  secretHash,
+		feePerKb:    feePerKb,
+		minFeePerKb: minFeePerKb,
+	})
+	if err != nil {
+		return err
+	}
+
+	/* building a fake redeem tx to get the fee */
+	contractOutPoint := wire.OutPoint{
+		Hash:  *b.contractTxHash,
+		Index: uint32(0),
+	}
+	_, addrs, _, _ := txscript.ExtractPkScriptAddrs(b.refundTx.TxOut[0].PkScript, chainParams)
+	redeemTx, redeemFee, err := buildRedeem(c, &redeemArgs{
+		contract:         b.contract,
+		contractTx:       b.contractTx,
+		locktime:         locktime,
+		contractOutPoint: &contractOutPoint,
+		outScript:        b.refundTx.TxOut[0].PkScript,
+		recipientAddr:    addrs[0],
+		secret:           secret[:],
+		feePerKb:         feePerKb,
+		minFeePerKb:      minFeePerKb,
 	})
 	if err != nil {
 		return err
@@ -825,11 +890,13 @@ func (cmd *initiateCmd) runCommand(c *rpc.Client) error {
 	refundTxHash := b.refundTx.TxHash()
 	contractFeePerKb := calcFeePerKb(b.contractFee, b.contractTx.SerializeSize())
 	refundFeePerKb := calcFeePerKb(b.refundFee, b.refundTx.SerializeSize())
+	redeemFeePerKb := calcFeePerKb(redeemFee, redeemTx.SerializeSize())
 
 	fmt.Printf("Secret:      %x\n", secret)
 	fmt.Printf("Secret hash: %x\n\n", secretHash)
 	fmt.Printf("Contract fee: %v (%0.8f LTC/kB)\n", b.contractFee, contractFeePerKb)
-	fmt.Printf("Refund fee:   %v (%0.8f LTC/kB)\n\n", b.refundFee, refundFeePerKb)
+	fmt.Printf("Refund fee:   %v (%0.8f LTC/kB)\n", b.refundFee, refundFeePerKb)
+	fmt.Printf("Possible redeem fee: %v (%0.8f LTC/kB)\n\n", redeemFee, redeemFeePerKb)
 	fmt.Printf("Contract (%v):\n", b.contractP2SH)
 	fmt.Printf("%x\n\n", b.contract)
 	var contractBuf bytes.Buffer
@@ -851,12 +918,41 @@ func (cmd *participateCmd) runCommand(c *rpc.Client) error {
 	// as a unix time rather than a block height.
 	locktime := time.Now().Add(24 * time.Hour).Unix()
 
+	feePerKb, minFeePerKb, err := getFeePerKb(c)
+	if err != nil {
+		return err
+	}
+
 	b, err := buildContract(c, &contractArgs{
-		inputs:     cmd.inputs,
-		them:       cmd.cp1Addr,
-		amount:     cmd.amount,
-		locktime:   locktime,
-		secretHash: cmd.secretHash,
+		inputs:      cmd.inputs,
+		them:        cmd.cp1Addr,
+		amount:      cmd.amount,
+		locktime:    locktime,
+		secretHash:  cmd.secretHash,
+		feePerKb:    feePerKb,
+		minFeePerKb: minFeePerKb,
+	})
+	if err != nil {
+		return err
+	}
+
+	/* building a fake redeem tx to get the fee */
+	contractOutPoint := wire.OutPoint{
+		Hash:  *b.contractTxHash,
+		Index: uint32(0),
+	}
+	_, addrs, _, _ := txscript.ExtractPkScriptAddrs(b.refundTx.TxOut[0].PkScript, chainParams)
+	secret := make([]byte, secretSize)
+	redeemTx, redeemFee, err := buildRedeem(c, &redeemArgs{
+		contract:         b.contract,
+		contractTx:       b.contractTx,
+		locktime:         locktime,
+		contractOutPoint: &contractOutPoint,
+		outScript:        b.refundTx.TxOut[0].PkScript,
+		recipientAddr:    addrs[0],
+		secret:           secret[:],
+		feePerKb:         feePerKb,
+		minFeePerKb:      minFeePerKb,
 	})
 	if err != nil {
 		return err
@@ -865,9 +961,11 @@ func (cmd *participateCmd) runCommand(c *rpc.Client) error {
 	refundTxHash := b.refundTx.TxHash()
 	contractFeePerKb := calcFeePerKb(b.contractFee, b.contractTx.SerializeSize())
 	refundFeePerKb := calcFeePerKb(b.refundFee, b.refundTx.SerializeSize())
+	redeemFeePerKb := calcFeePerKb(redeemFee, redeemTx.SerializeSize())
 
 	fmt.Printf("Contract fee: %v (%0.8f LTC/kB)\n", b.contractFee, contractFeePerKb)
-	fmt.Printf("Refund fee:   %v (%0.8f LTC/kB)\n\n", b.refundFee, refundFeePerKb)
+	fmt.Printf("Refund fee:   %v (%0.8f LTC/kB)\n", b.refundFee, refundFeePerKb)
+	fmt.Printf("Possible redeem fee: %v (%0.8f LTC/kB)\n\n", redeemFee, redeemFeePerKb)
 	fmt.Printf("Contract (%v):\n", b.contractP2SH)
 	fmt.Printf("%x\n\n", b.contract)
 	var contractBuf bytes.Buffer
@@ -931,34 +1029,28 @@ func (cmd *redeemCmd) runCommand(c *rpc.Client) error {
 		return err
 	}
 
-	redeemTx := wire.NewMsgTx(txVersion)
-	redeemTx.LockTime = uint32(pushes.LockTime)
-	redeemTx.AddTxIn(wire.NewTxIn(&contractOutPoint, nil, nil))
-	redeemTx.AddTxOut(wire.NewTxOut(0, outScript)) // amount set below
-	redeemSize := estimateRedeemSerializeSize(cmd.contract, redeemTx.TxOut)
-	fee := txrules.FeeForSerializeSize(feePerKb, redeemSize)
-	redeemTx.TxOut[0].Value = cmd.contractTx.TxOut[contractOut].Value - int64(fee)
-	if txrules.IsDustOutput(redeemTx.TxOut[0], minFeePerKb) {
-		return fmt.Errorf("redeem output value of %v is dust", ltcutil.Amount(redeemTx.TxOut[0].Value))
-	}
-
-	redeemSig, redeemPubKey, err := createSig(redeemTx, 0, cmd.contract, recipientAddr, c)
+	redeemTx, redeemFee, err := buildRedeem(c, &redeemArgs{
+		contract:         cmd.contract,
+		contractTx:       cmd.contractTx,
+		locktime:         pushes.LockTime,
+		contractOutPoint: &contractOutPoint,
+		outScript:        outScript,
+		recipientAddr:    recipientAddr,
+		secret:           cmd.secret,
+		feePerKb:         feePerKb,
+		minFeePerKb:      minFeePerKb,
+	})
 	if err != nil {
 		return err
 	}
-	redeemSigScript, err := redeemP2SHContract(cmd.contract, redeemSig, redeemPubKey, cmd.secret)
-	if err != nil {
-		return err
-	}
-	redeemTx.TxIn[0].SignatureScript = redeemSigScript
 
 	redeemTxHash := redeemTx.TxHash()
-	redeemFeePerKb := calcFeePerKb(fee, redeemTx.SerializeSize())
+	redeemFeePerKb := calcFeePerKb(redeemFee, redeemTx.SerializeSize())
 
 	var buf bytes.Buffer
 	buf.Grow(redeemTx.SerializeSize())
 	redeemTx.Serialize(&buf)
-	fmt.Printf("Redeem fee: %v (%0.8f LTC/kB)\n\n", fee, redeemFeePerKb)
+	fmt.Printf("Redeem fee: %v (%0.8f LTC/kB)\n\n", redeemFee, redeemFeePerKb)
 	fmt.Printf("Redeem transaction (%v):\n", &redeemTxHash)
 	fmt.Printf("%x\n\n", buf.Bytes())
 
