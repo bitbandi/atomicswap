@@ -1010,8 +1010,8 @@ func (cmd *initiateCmd) runCommand(c *rpc.Client) error {
 
 	fmt.Printf("Secret:      %x\n", secret)
 	fmt.Printf("Secret hash: %x\n\n", secretHash)
-	fmt.Printf("Contract fee: %v (%0.8f MEC/kB)\n", b.contractFee, contractFeePerKb)
-	fmt.Printf("Refund fee:   %v (%0.8f MEC/kB)\n\n", b.refundFee, refundFeePerKb)
+	fmt.Printf("Contract fee: %0.8f MEC (%0.8f MEC/kB)\n", b.contractFee.ToBTC(), contractFeePerKb)
+	fmt.Printf("Refund fee:   %0.8f MEC (%0.8f MEC/kB)\n\n", b.refundFee.ToBTC(), refundFeePerKb)
 	fmt.Printf("Contract (%v):\n", b.contractP2SH)
 	fmt.Printf("%x\n\n", b.contract)
 	var contractBuf bytes.Buffer
@@ -1048,8 +1048,8 @@ func (cmd *participateCmd) runCommand(c *rpc.Client) error {
 	contractFeePerKb := calcFeePerKb(b.contractFee, b.contractTx.SerializeSize())
 	refundFeePerKb := calcFeePerKb(b.refundFee, b.refundTx.SerializeSize())
 
-	fmt.Printf("Contract fee: %v (%0.8f MEC/kB)\n", b.contractFee, contractFeePerKb)
-	fmt.Printf("Refund fee:   %v (%0.8f MEC/kB)\n\n", b.refundFee, refundFeePerKb)
+	fmt.Printf("Contract fee: %0.8f MEC (%0.8f MEC/kB)\n", b.contractFee.ToBTC(), contractFeePerKb)
+	fmt.Printf("Refund fee:   %0.8f MEC (%0.8f MEC/kB)\n\n", b.refundFee.ToBTC(), refundFeePerKb)
 	fmt.Printf("Contract (%v):\n", b.contractP2SH)
 	fmt.Printf("%x\n\n", b.contract)
 	var contractBuf bytes.Buffer
@@ -1140,7 +1140,7 @@ func (cmd *redeemCmd) runCommand(c *rpc.Client) error {
 	var buf bytes.Buffer
 	buf.Grow(redeemTx.SerializeSize())
 	redeemTx.Serialize(&buf)
-	fmt.Printf("Redeem fee: %v (%0.8f MEC/kB)\n\n", fee, redeemFeePerKb)
+	fmt.Printf("Redeem fee: %0.8f MEC (%0.8f MEC/kB)\n\n", fee.ToBTC(), redeemFeePerKb)
 	fmt.Printf("Redeem transaction (%v):\n", &redeemTxHash)
 	fmt.Printf("%x\n\n", buf.Bytes())
 
@@ -1185,7 +1185,7 @@ func (cmd *refundCmd) runCommand(c *rpc.Client) error {
 
 	refundFeePerKb := calcFeePerKb(refundFee, refundTx.SerializeSize())
 
-	fmt.Printf("Refund fee: %v (%0.8f MEC/kB)\n\n", refundFee, refundFeePerKb)
+	fmt.Printf("Refund fee: %0.8f MEC (%0.8f MEC/kB)\n\n", refundFee.ToBTC(), refundFeePerKb)
 	fmt.Printf("Refund transaction (%v):\n", &refundTxHash)
 	fmt.Printf("%x\n\n", buf.Bytes())
 
@@ -1265,7 +1265,7 @@ func (cmd *auditContractCmd) runOfflineCommand() error {
 	}
 
 	fmt.Printf("Contract address:        %v\n", contractAddr)
-	fmt.Printf("Contract value:          %v\n", btcutil.Amount(cmd.contractTx.TxOut[contractOut].Value))
+	fmt.Printf("Contract value:          %0.8f MEC\n", btcutil.Amount(cmd.contractTx.TxOut[contractOut].Value).ToBTC())
 	fmt.Printf("Recipient address:       %v\n", recipientAddr)
 	fmt.Printf("Author's refund address: %v\n\n", refundAddr)
 
